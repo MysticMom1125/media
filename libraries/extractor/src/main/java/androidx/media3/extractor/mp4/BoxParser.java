@@ -98,6 +98,9 @@ public final class BoxParser {
   @SuppressWarnings("ConstantCaseForConstants")
   private static final int TYPE_vide = 0x76696465;
 
+  private static final int SAMPLE_RATE_AMR_NB = 8_000;
+  private static final int SAMPLE_RATE_AMR_WB = 16_000;
+
   /**
    * The threshold number of samples to trim from the start/end of an audio track when applying an
    * edit below which gapless info can be used (rather than removing samples from the sample table).
@@ -721,16 +724,15 @@ public final class BoxParser {
         // frames appear after their respective sync frames. This ensures that although the result
         // of the binary search might not be entirely accurate (due to the out-of-order timestamps),
         // the following logic ensures correctness for both start and end indices.
-        //
+
         // The startIndices calculation finds the largest timestamp that is less than or equal to
         // editMediaTime. It then walks backward to ensure the index points to a sync frame, since
-        // decoding must start from a keyframe.
+        // decoding must start from a keyframe. If a sync frame is not found by walking backward, it
+        // walks forward from the initially found index to find a sync frame.
         startIndices[i] =
             Util.binarySearchFloor(
                 timestamps, editMediaTime, /* inclusive= */ true, /* stayInBounds= */ true);
-        while (startIndices[i] >= 0 && (flags[startIndices[i]] & C.BUFFER_FLAG_KEY_FRAME) == 0) {
-          startIndices[i]--;
-        }
+
         // The endIndices calculation finds the smallest timestamp that is greater than
         // editMediaTime + editDuration, except when omitZeroDurationClippedSample is true, in which
         // case it finds the smallest timestamp that is greater than or equal to editMediaTime +
@@ -741,7 +743,21 @@ public final class BoxParser {
                 editMediaTime + editDuration,
                 /* inclusive= */ omitZeroDurationClippedSample,
                 /* stayInBounds= */ false);
-        if (track.type == C.TRACK_TYPE_VIDEO) {
+
+        int initialStartIndex = startIndices[i];
+        while (startIndices[i] >= 0 && (flags[startIndices[i]] & C.BUFFER_FLAG_KEY_FRAME) == 0) {
+          startIndices[i]--;
+        }
+
+        if (startIndices[i] < 0) {
+          startIndices[i] = initialStartIndex;
+          while (startIndices[i] < endIndices[i]
+              && (flags[startIndices[i]] & C.BUFFER_FLAG_KEY_FRAME) == 0) {
+            startIndices[i]++;
+          }
+        }
+
+        if (track.type == C.TRACK_TYPE_VIDEO && startIndices[i] != endIndices[i]) {
           // To account for out-of-order video frames that may have timestamps smaller than or equal
           // to editMediaTime + editDuration, but still fall within the valid range, the loop walks
           // forward through the timestamps array to ensure all frames with timestamps within the
@@ -1033,7 +1049,8 @@ public final class BoxParser {
           || childAtomType == Mp4Box.TYPE_dvav
           || childAtomType == Mp4Box.TYPE_dva1
           || childAtomType == Mp4Box.TYPE_dvhe
-          || childAtomType == Mp4Box.TYPE_dvh1) {
+          || childAtomType == Mp4Box.TYPE_dvh1
+          || childAtomType == Mp4Box.TYPE_apv1) {
         parseVideoSampleEntry(
             stsd,
             childAtomType,
@@ -1207,6 +1224,7 @@ public final class BoxParser {
     @C.StereoMode int stereoMode = Format.NO_VALUE;
     @Nullable EsdsData esdsData = null;
     int maxNumReorderSamples = Format.NO_VALUE;
+    int maxSubLayers = Format.NO_VALUE;
     @Nullable NalUnitUtil.H265VpsData vpsData = null;
 
     // HDR related metadata.
@@ -1254,6 +1272,7 @@ public final class BoxParser {
           pixelWidthHeightRatio = hevcConfig.pixelWidthHeightRatio;
         }
         maxNumReorderSamples = hevcConfig.maxNumReorderPics;
+        maxSubLayers = hevcConfig.maxSubLayers;
         codecs = hevcConfig.codecs;
         if (hevcConfig.stereoMode != Format.NO_VALUE) {
           // HEVCDecoderConfigurationRecord may include 3D reference displays information SEI.
@@ -1454,6 +1473,22 @@ public final class BoxParser {
               break;
           }
         }
+      } else if (childAtomType == Mp4Box.TYPE_apvC) {
+        mimeType = MimeTypes.VIDEO_APV;
+
+        int childAtomBodySize = childAtomSize - Mp4Box.FULL_HEADER_SIZE;
+        byte[] initializationDataChunk = new byte[childAtomBodySize];
+        parent.setPosition(childStartPosition + Mp4Box.FULL_HEADER_SIZE); // Skip version and flags.
+        parent.readBytes(initializationDataChunk, /* offset= */ 0, childAtomBodySize);
+        initializationData = ImmutableList.of(initializationDataChunk);
+
+        ColorInfo colorInfo = parseApvc(new ParsableByteArray(initializationDataChunk));
+
+        bitdepthLuma = colorInfo.lumaBitdepth;
+        bitdepthChroma = colorInfo.chromaBitdepth;
+        colorSpace = colorInfo.colorSpace;
+        colorRange = colorInfo.colorRange;
+        colorTransfer = colorInfo.colorTransfer;
       } else if (childAtomType == Mp4Box.TYPE_colr) {
         // Only modify these values if 'colorSpace' and 'colorTransfer' have not been previously
         // established by the bitstream. The absence of color descriptors ('colorSpace' and
@@ -1506,6 +1541,7 @@ public final class BoxParser {
             .setStereoMode(stereoMode)
             .setInitializationData(initializationData)
             .setMaxNumReorderSamples(maxNumReorderSamples)
+            .setMaxSubLayers(maxSubLayers)
             .setDrmInitData(drmInitData)
             // Note that if either mdcv or clli are missing, we leave the corresponding HDR static
             // metadata bytes with value zero. See [Internal ref: b/194535665].
@@ -1660,6 +1696,56 @@ public final class BoxParser {
     return colorInfo.build();
   }
 
+  /**
+   * Parses the apvC configuration record and returns a {@link ColorInfo} from its data.
+   *
+   * <p>See apvC configuration record syntax from the <a
+   * href="https://github.com/openapv/openapv/blob/main/readme/apv_isobmff.md#syntax-1">spec</a>.
+   *
+   * <p>The sections referenced in the method are from this spec.
+   *
+   * @param data The apvC atom data.
+   * @return {@link ColorInfo} parsed from the apvC data.
+   */
+  private static ColorInfo parseApvc(ParsableByteArray data) {
+    ColorInfo.Builder colorInfo = new ColorInfo.Builder();
+    ParsableBitArray bitArray = new ParsableBitArray(data.getData());
+    bitArray.setPosition(data.getPosition() * 8); // Convert byte to bit position.
+    // See APVDecoderConfigurationRecord syntax.
+    bitArray.skipBytes(1); // configurationVersion
+    int numConfigurationEntries = bitArray.readBits(8); // number_of_configuration_entry
+    for (int i = 0; i < numConfigurationEntries; i++) {
+      bitArray.skipBytes(1); // pbu_type
+      int numberOfFrameInfo = bitArray.readBits(8);
+      for (int j = 0; j < numberOfFrameInfo; j++) {
+        bitArray.skipBits(6); // reserved_zero_6bits
+        boolean isColorDescriptionPresent =
+            bitArray.readBit(); // color_description_present_flag_info
+        bitArray.skipBit(); // capture_time_distance_ignored
+        // Skip profile_idc (1 byte), level_idc (1 byte), band_idc (1 byte), frame_width (4 bytes),
+        // frame_height (4 bytes).
+        bitArray.skipBytes(11);
+        bitArray.skipBits(4); // chroma_format_idc (4 bits)
+        int bitDepth = bitArray.readBits(4) + 8; // bit_depth_minus8 + 8
+        colorInfo.setLumaBitdepth(bitDepth);
+        colorInfo.setChromaBitdepth(bitDepth);
+        bitArray.skipBytes(1); // capture_time_distance
+        if (isColorDescriptionPresent) {
+          int colorPrimaries = bitArray.readBits(8); // color_primaries
+          int transferCharacteristics = bitArray.readBits(8); // transfer_characteristics
+          bitArray.skipBytes(1); // matrix_coefficients
+          boolean fullRangeFlag = bitArray.readBit(); // full_range_flag
+          colorInfo
+              .setColorSpace(ColorInfo.isoColorPrimariesToColorSpace(colorPrimaries))
+              .setColorRange(fullRangeFlag ? C.COLOR_RANGE_FULL : C.COLOR_RANGE_LIMITED)
+              .setColorTransfer(
+                  ColorInfo.isoTransferCharacteristicsToColorTransfer(transferCharacteristics));
+        }
+      }
+    }
+    return colorInfo.build();
+  }
+
   private static ByteBuffer allocateHdrStaticInfo() {
     // For HDR static info, Android decoders expect a 25-byte array. The first byte is zero to
     // represent Static Metadata Type 1, as per CTA-861-G:2017, Table 44. The following 24 bytes
@@ -1791,12 +1877,20 @@ public final class BoxParser {
       return;
     }
 
-    // As per the IAMF spec (https://aomediacodec.github.io/iamf/#iasampleentry-section),
-    // channelCount and sampleRate SHALL be set to 0 and ignored. We ignore it by using
-    // Format.NO_VALUE instead of 0.
     if (atomType == Mp4Box.TYPE_iamf) {
+      // As per the IAMF spec (https://aomediacodec.github.io/iamf/#iasampleentry-section),
+      // channelCount and sampleRate SHALL be set to 0 and ignored. We ignore it by using
+      // Format.NO_VALUE instead of 0.
       channelCount = Format.NO_VALUE;
       sampleRate = Format.NO_VALUE;
+    } else if (atomType == Mp4Box.TYPE_samr) {
+      // AMR NB audio is always mono, 8kHz
+      channelCount = 1;
+      sampleRate = SAMPLE_RATE_AMR_NB;
+    } else if (atomType == Mp4Box.TYPE_sawb) {
+      // AMR WB audio is always mono, 16kHz
+      channelCount = 1;
+      sampleRate = SAMPLE_RATE_AMR_WB;
     }
 
     int childPosition = parent.getPosition();
@@ -2167,8 +2261,7 @@ public final class BoxParser {
             new StriData(
                 ((striInfo & 0x01) == 0x01),
                 ((striInfo & 0x02) == 0x02),
-                ((striInfo & 0x08) == 0x08),
-                ((striInfo & 0x04) == 0x04)));
+                ((striInfo & 0x08) == 0x08)));
       }
       childPosition += childAtomSize;
     }
@@ -2438,17 +2531,11 @@ public final class BoxParser {
     private final boolean hasLeftEyeView;
     private final boolean hasRightEyeView;
     private final boolean eyeViewsReversed;
-    private final boolean hasAdditionalViews;
 
-    public StriData(
-        boolean hasLeftEyeView,
-        boolean hasRightEyeView,
-        boolean eyeViewsReversed,
-        boolean hasAdditionalViews) {
+    public StriData(boolean hasLeftEyeView, boolean hasRightEyeView, boolean eyeViewsReversed) {
       this.hasLeftEyeView = hasLeftEyeView;
       this.hasRightEyeView = hasRightEyeView;
       this.eyeViewsReversed = eyeViewsReversed;
-      this.hasAdditionalViews = hasAdditionalViews;
     }
   }
 

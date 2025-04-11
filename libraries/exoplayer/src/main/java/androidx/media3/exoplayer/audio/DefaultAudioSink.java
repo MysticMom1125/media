@@ -20,7 +20,6 @@ import static androidx.media3.common.util.Assertions.checkState;
 import static androidx.media3.common.util.Util.constrainValue;
 import static androidx.media3.common.util.Util.msToUs;
 import static androidx.media3.exoplayer.audio.AudioCapabilities.DEFAULT_AUDIO_CAPABILITIES;
-import static androidx.media3.exoplayer.audio.AudioCapabilities.getCapabilities;
 import static java.lang.Math.max;
 import static java.lang.Math.min;
 import static java.lang.annotation.ElementType.TYPE_USE;
@@ -77,6 +76,7 @@ import java.nio.ByteOrder;
 import java.util.ArrayDeque;
 import java.util.concurrent.Future;
 import java.util.concurrent.ScheduledExecutorService;
+import org.checkerframework.checker.nullness.qual.EnsuresNonNull;
 import org.checkerframework.checker.nullness.qual.MonotonicNonNull;
 import org.checkerframework.checker.nullness.qual.RequiresNonNull;
 
@@ -539,7 +539,7 @@ public final class DefaultAudioSink implements AudioSink {
   private @MonotonicNonNull Configuration configuration;
   private @MonotonicNonNull AudioProcessingPipeline audioProcessingPipeline;
   @Nullable private AudioTrack audioTrack;
-  private AudioCapabilities audioCapabilities;
+  private @MonotonicNonNull AudioCapabilities audioCapabilities;
   private @MonotonicNonNull AudioCapabilitiesReceiver audioCapabilitiesReceiver;
   @Nullable private OnRoutingChangedListenerApi24 onRoutingChangedListener;
 
@@ -588,10 +588,7 @@ public final class DefaultAudioSink implements AudioSink {
   private DefaultAudioSink(Builder builder) {
     context = builder.context;
     audioAttributes = AudioAttributes.DEFAULT;
-    audioCapabilities =
-        context != null
-            ? getCapabilities(context, audioAttributes, /* routedDevice= */ null)
-            : builder.audioCapabilities;
+    audioCapabilities = context != null ? null : builder.audioCapabilities;
     audioProcessorChain = builder.audioProcessorChain;
     enableFloatOutput = builder.enableFloatOutput;
     preferAudioTrackPlaybackParams = Util.SDK_INT >= 23 && builder.enableAudioTrackPlaybackParams;
@@ -604,7 +601,9 @@ public final class DefaultAudioSink implements AudioSink {
     toIntPcmAvailableAudioProcessors =
         ImmutableList.of(
             new ToInt16PcmAudioProcessor(), channelMappingAudioProcessor, trimmingAudioProcessor);
-    toFloatPcmAvailableAudioProcessors = ImmutableList.of(new ToFloatPcmAudioProcessor());
+    toFloatPcmAvailableAudioProcessors =
+        ImmutableList.of(
+            new ToFloatPcmAudioProcessor(), channelMappingAudioProcessor, trimmingAudioProcessor);
     volume = 1f;
     audioSessionId = C.AUDIO_SESSION_ID_UNSET;
     auxEffectInfo = new AuxEffectInfo(AuxEffectInfo.NO_AUX_EFFECT_ID, 0f);
@@ -677,7 +676,7 @@ public final class DefaultAudioSink implements AudioSink {
     if (!isAudioTrackInitialized() || startMediaTimeUsNeedsInit) {
       return CURRENT_POSITION_NOT_SET;
     }
-    long positionUs = audioTrackPositionTracker.getCurrentPositionUs(sourceEnded);
+    long positionUs = audioTrackPositionTracker.getCurrentPositionUs();
     positionUs = min(positionUs, configuration.framesToDurationUs(getWrittenFrames()));
     return applySkipping(applyMediaPositionParameters(positionUs));
   }
@@ -1278,8 +1277,9 @@ public final class DefaultAudioSink implements AudioSink {
       if (listener != null) {
         listener.onAudioSinkError(e);
       }
-      if (e.isRecoverable) {
+      if (e.isRecoverable && context != null) {
         // Change to the audio capabilities supported by all the devices during the error recovery.
+        // Only do this if we have a context and the capabilities can automatically adjust back.
         audioCapabilities = DEFAULT_AUDIO_CAPABILITIES;
         throw e; // Do not delay the exception if it can be recovered at higher level.
       }
@@ -1586,7 +1586,7 @@ public final class DefaultAudioSink implements AudioSink {
               + playbackLooperName
               + ")");
     }
-    if (!audioCapabilities.equals(this.audioCapabilities)) {
+    if (this.audioCapabilities != null && !audioCapabilities.equals(this.audioCapabilities)) {
       this.audioCapabilities = audioCapabilities;
       if (listener != null) {
         listener.onAudioCapabilitiesChanged();
@@ -1795,6 +1795,7 @@ public final class DefaultAudioSink implements AudioSink {
         : writtenEncodedFrames;
   }
 
+  @EnsuresNonNull("audioCapabilities")
   private void maybeStartAudioCapabilitiesReceiver() {
     if (audioCapabilitiesReceiver == null && context != null) {
       // Must be lazily initialized to receive audio capabilities receiver listener event on the
@@ -1805,6 +1806,7 @@ public final class DefaultAudioSink implements AudioSink {
               context, this::onAudioCapabilitiesChanged, audioAttributes, preferredDevice);
       audioCapabilities = audioCapabilitiesReceiver.register();
     }
+    checkNotNull(audioCapabilities);
   }
 
   private static boolean isOffloadedPlayback(AudioTrack audioTrack) {
@@ -2016,7 +2018,7 @@ public final class DefaultAudioSink implements AudioSink {
       }
       @Nullable AudioDeviceInfo routedDevice = router.getRoutedDevice();
       if (routedDevice != null) {
-        capabilitiesReceiver.setRoutedDevice(router.getRoutedDevice());
+        capabilitiesReceiver.setRoutedDevice(routedDevice);
       }
     }
   }

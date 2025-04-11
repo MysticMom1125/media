@@ -39,6 +39,7 @@ import androidx.annotation.Nullable;
 import androidx.annotation.RequiresApi;
 import androidx.collection.ArrayMap;
 import androidx.media3.common.MediaLibraryInfo;
+import androidx.media3.common.Player;
 import androidx.media3.common.util.Log;
 import androidx.media3.common.util.UnstableApi;
 import androidx.media3.common.util.Util;
@@ -157,6 +158,12 @@ public abstract class MediaSessionService extends Service {
 
   /** The action for {@link Intent} filter that must be declared by the service. */
   public static final String SERVICE_INTERFACE = "androidx.media3.session.MediaSessionService";
+
+  /**
+   * The default timeout for a session to stay in a foreground service state after it paused,
+   * stopped, failed or ended.
+   */
+  @UnstableApi public static final long DEFAULT_FOREGROUND_SERVICE_TIMEOUT_MS = 600_000;
 
   private static final String TAG = "MSessionService";
 
@@ -471,8 +478,40 @@ public abstract class MediaSessionService extends Service {
   }
 
   /**
-   * Returns whether there is a session with ongoing playback that must be paused or stopped before
-   * being able to terminate the service by calling {@link #stopSelf()}.
+   * Sets the timeout for a session to stay in a foreground service state after it paused, stopped,
+   * failed or ended.
+   *
+   * <p>Can only be called once the {@link Context} of the service is initialized in {@link
+   * #onCreate()}.
+   *
+   * <p>Has no effect on already running timeouts.
+   *
+   * <p>The default and maximum value is {@link #DEFAULT_FOREGROUND_SERVICE_TIMEOUT_MS}. If a larger
+   * value is provided, it will be clamped down to {@link #DEFAULT_FOREGROUND_SERVICE_TIMEOUT_MS}.
+   *
+   * @param foregroundServiceTimeoutMs The timeout in milliseconds.
+   */
+  @UnstableApi
+  public final void setForegroundServiceTimeoutMs(long foregroundServiceTimeoutMs) {
+    getMediaNotificationManager()
+        .setUserEngagedTimeoutMs(
+            Util.constrainValue(
+                foregroundServiceTimeoutMs,
+                /* min= */ 0,
+                /* max= */ DEFAULT_FOREGROUND_SERVICE_TIMEOUT_MS));
+  }
+
+  /**
+   * Returns whether there is a session with ongoing user-engaged playback that is run in a
+   * foreground service.
+   *
+   * <p>It is only possible to terminate the service with {@link #stopSelf()} if this method returns
+   * {@code false}.
+   *
+   * <p>Note that sessions are kept in foreground and this method returns {@code true} for the
+   * {@linkplain #setForegroundServiceTimeoutMs foreground service timeout} after they paused,
+   * stopped, failed or ended. Use {@link #pauseAllPlayersAndStopSelf()} to pause all ongoing
+   * playbacks immediately and terminate the service.
    */
   @UnstableApi
   public boolean isPlaybackOngoing() {
@@ -480,13 +519,15 @@ public abstract class MediaSessionService extends Service {
   }
 
   /**
-   * Pauses the player of each session managed by the service and calls {@link #stopSelf()}.
+   * Pauses the player of each session managed by the service, ensures the foreground service is
+   * stopped, and calls {@link #stopSelf()}.
    *
    * <p>This terminates the service lifecycle and triggers {@link #onDestroy()} that an app can
    * override to release the sessions and other resources.
    */
   @UnstableApi
   public void pauseAllPlayersAndStopSelf() {
+    getMediaNotificationManager().disableUserEngagedTimeout();
     List<MediaSession> sessionList = getSessions();
     for (int i = 0; i < sessionList.size(); i++) {
       sessionList.get(i).getPlayer().setPlayWhenReady(false);
@@ -497,10 +538,15 @@ public abstract class MediaSessionService extends Service {
   /**
    * {@inheritDoc}
    *
-   * <p>If {@linkplain #isPlaybackOngoing() playback is ongoing}, the service continues running in
-   * the foreground when the app is dismissed from the recent apps. Otherwise, the service is
-   * stopped by calling {@link #stopSelf()} which terminates the service lifecycle and triggers
-   * {@link #onDestroy()} that an app can override to release the sessions and other resources.
+   * <p>This method can be overridden to customize the behavior of when the app is dismissed from
+   * the recent apps.
+   *
+   * <p>The default behavior is that if {@linkplain #isPlaybackOngoing() playback is ongoing}, which
+   * means the service is already running in the foreground, and at least one media session {@link
+   * Player#isPlaying() is playing}, the service is kept running. Otherwise, playbacks are paused
+   * and the service is stopped by calling {@link #pauseAllPlayersAndStopSelf()} which terminates
+   * the service lifecycle and triggers {@link #onDestroy()} that an app can override to release the
+   * sessions and other resources.
    *
    * <p>An app can safely override this method without calling super to implement a different
    * behaviour, for instance unconditionally calling {@link #pauseAllPlayersAndStopSelf()} to stop
@@ -519,10 +565,10 @@ public abstract class MediaSessionService extends Service {
    */
   @Override
   public void onTaskRemoved(@Nullable Intent rootIntent) {
-    if (!isPlaybackOngoing()) {
-      // The service needs to be stopped when playback is not ongoing and the service is not in the
-      // foreground.
-      stopSelf();
+    if (!isPlaybackOngoing() || !isAnySessionPlaying()) {
+      // The service needs to be stopped when playback is not ongoing (i.e, the service is not in
+      // the foreground). It is also force-stopped if no session is playing.
+      pauseAllPlayersAndStopSelf();
     }
   }
 
@@ -619,7 +665,7 @@ public abstract class MediaSessionService extends Service {
       MediaSession session, boolean startInForegroundWhenPaused) {
     try {
       boolean startInForegroundRequired =
-          getMediaNotificationManager().shouldRunInForeground(session, startInForegroundWhenPaused);
+          getMediaNotificationManager().shouldRunInForeground(startInForegroundWhenPaused);
       onUpdateNotification(session, startInForegroundRequired);
     } catch (/* ForegroundServiceStartNotAllowedException */ IllegalStateException e) {
       if ((Util.SDK_INT >= 31) && Api31.instanceOfForegroundServiceStartNotAllowedException(e)) {
@@ -636,6 +682,7 @@ public abstract class MediaSessionService extends Service {
     synchronized (lock) {
       if (mediaNotificationManager == null) {
         if (mediaNotificationProvider == null) {
+          checkStateNotNull(getBaseContext(), "Accessing service context before onCreate()");
           mediaNotificationProvider =
               new DefaultMediaNotificationProvider.Builder(getApplicationContext()).build();
         }
@@ -672,6 +719,16 @@ public abstract class MediaSessionService extends Service {
             serviceListener.onForegroundServiceStartNotAllowedException();
           }
         });
+  }
+
+  private boolean isAnySessionPlaying() {
+    List<MediaSession> sessionList = getSessions();
+    for (int i = 0; i < sessionList.size(); i++) {
+      if (sessionList.get(i).getPlayer().isPlaying()) {
+        return true;
+      }
+    }
+    return false;
   }
 
   private final class MediaSessionListener implements MediaSession.Listener {
